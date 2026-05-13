@@ -1,0 +1,236 @@
+name: Download Large File in Parts
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_url:
+        description: "URL of the file to download"
+        required: true
+        type: string
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Configure Git for Large Files
+        run: |
+          # Configure git for better large file handling
+          git config --global http.postBuffer 524288000
+          git config --global http.maxRequestBuffer 100M
+          git config --global core.compression 0
+          git config --global pack.windowMemory 256m
+          git config --global pack.packSizeLimit 100m
+          git config --global pack.threads 1
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          echo "Git configured for large file handling"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Create download folder
+        run: mkdir -p download
+
+      - name: Download file in 45 MiB parts using Python
+        env:
+          FILE_URL: ${{ github.event.inputs.file_url }}
+        run: |
+          python - <<'PY'
+          import math
+          import os
+          from pathlib import Path
+
+          import requests
+
+          url = os.environ["FILE_URL"]
+          part_size = 45 * 1024 * 1024  # 45 MiB = 47,185,920 bytes
+
+          filename = url.split("?")[0].rstrip("/").split("/")[-1] or "downloaded_file"
+
+          with requests.head(url, allow_redirects=True, timeout=30) as r:
+              r.raise_for_status()
+              total_size = int(r.headers.get("Content-Length", 0))
+
+          if total_size <= 0:
+              raise RuntimeError("Could not determine file size from Content-Length")
+
+          print(f"Filename: {filename}")
+          print(f"Total size: {total_size} bytes")
+          print(f"Part size: {part_size} bytes")
+
+          out_dir = Path("download")
+          part = 0
+          start = 0
+
+          session = requests.Session()
+
+          while start < total_size:
+              end = min(start + part_size - 1, total_size - 1)
+              out_path = out_dir / f"{filename}_{part}.part"
+
+              print(f"Downloading bytes {start}-{end} -> {out_path}")
+              headers = {"Range": f"bytes={start}-{end}"}
+              resp = session.get(url, headers=headers, stream=True, timeout=120)
+              resp.raise_for_status()
+
+              with open(out_path, "wb") as f:
+                  for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                      if chunk:
+                          f.write(chunk)
+
+              start = end + 1
+              part += 1
+
+          print("Download complete")
+          PY
+
+      - name: Incremental Commit & Push (Batched)
+        run: |
+          # Get branch name (assumes workflow_dispatch runs on main or similar)
+          BRANCH="${GITHUB_REF_NAME:-main}"
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          echo "AVASAM (https://avasam.ir) - Incremental Push Mode for Downloaded Parts"
+
+          # Check if download folder exists
+          if [ ! -d "download" ]; then
+            echo "No 'download' folder found. Nothing to push."
+            exit 0
+          fi
+
+          # Function to push files in small batches
+          push_batch() {
+            local BATCH_SIZE=3  # Push 3 files per batch (each ~135MB if 45MB parts)
+            local FILES=("$@")
+            local BATCH_COUNT=0
+            local BATCH_FILES=()
+            local TOTAL_PUSHED=0
+            local TOTAL_FILES=${#FILES[@]}
+
+            for FILE in "${FILES[@]}"; do
+              BATCH_FILES+=("$FILE")
+              BATCH_COUNT=$((BATCH_COUNT + 1))
+              if [ $BATCH_COUNT -ge $BATCH_SIZE ]; then
+                TOTAL_PUSHED=$((TOTAL_PUSHED + BATCH_COUNT))
+                echo ">>> Pushing batch ($TOTAL_PUSHED/$TOTAL_FILES files)..."
+                # Sync with remote
+                git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+                git reset --hard origin/"$BRANCH" 2>/dev/null || true
+
+                # Add batch files
+                for BF in "${BATCH_FILES[@]}"; do
+                  git add "$BF" 2>/dev/null || true
+                done
+
+                # Commit batch
+                if ! git diff --cached --quiet 2>/dev/null; then
+                  git commit -m "[AVASAM] Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
+                  # Push with retries
+                  local PUSH_RETRY=0
+                  local PUSH_SUCCESS=false
+                  while [ $PUSH_RETRY -lt 5 ]; do
+                    PUSH_RETRY=$((PUSH_RETRY + 1))
+                    if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
+                      PUSH_SUCCESS=true
+                      echo "    Batch pushed successfully!"
+                      break
+                    else
+                      echo "    Batch push failed, attempt $PUSH_RETRY/5..."
+                      git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+                      git reset --hard origin/"$BRANCH" 2>/dev/null || true
+                      for BF in "${BATCH_FILES[@]}"; do
+                        git add "$BF" 2>/dev/null || true
+                      done
+                      if ! git diff --cached --quiet 2>/dev/null; then
+                        git commit -m "[AVASAM] Add batch of $BATCH_COUNT files [skip ci]" --quiet 2>/dev/null || true
+                      fi
+                      sleep $((3 + RANDOM % 7))
+                    fi
+                  done
+                  if [ "$PUSH_SUCCESS" = false ]; then
+                    echo "    WARNING: Batch push failed after 5 attempts"
+                  fi
+                fi
+                BATCH_FILES=()
+                BATCH_COUNT=0
+                sleep 2
+              fi
+            done
+
+            # Push remaining files (if any)
+            if [ ${#BATCH_FILES[@]} -gt 0 ]; then
+              TOTAL_PUSHED=$((TOTAL_PUSHED + ${#BATCH_FILES[@]}))
+              echo ">>> Pushing final batch ($TOTAL_PUSHED/$TOTAL_FILES files)..."
+              git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+              git reset --hard origin/"$BRANCH" 2>/dev/null || true
+
+              for BF in "${BATCH_FILES[@]}"; do
+                git add "$BF" 2>/dev/null || true
+              done
+
+              if ! git diff --cached --quiet 2>/dev/null; then
+                git commit -m "[AVASAM] Add final batch [skip ci]" --quiet 2>/dev/null || true
+                local PUSH_RETRY=0
+                while [ $PUSH_RETRY -lt 5 ]; do
+                  PUSH_RETRY=$((PUSH_RETRY + 1))
+                  if timeout 180 git push origin HEAD:"$BRANCH" 2>&1; then
+                    echo "    Final batch pushed successfully!"
+                    break
+                  else
+                    echo "    Push failed, retry $PUSH_RETRY/5..."
+                    sleep 3
+                    git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+                    git reset --hard origin/"$BRANCH" 2>/dev/null || true
+                    for BF in "${BATCH_FILES[@]}"; do
+                      git add "$BF" 2>/dev/null || true
+                    done
+                    if ! git diff --cached --quiet 2>/dev/null; then
+                      git commit -m "[AVASAM] Add final batch [skip ci]" --quiet 2>/dev/null || true
+                    fi
+                  fi
+                done
+              fi
+            fi
+          }
+
+          # ============================================
+          # MAIN INCREMENTAL PUSH LOGIC
+          # ============================================
+          echo "Starting incremental push process..."
+          git fetch origin "$BRANCH"
+          git reset --hard origin/"$BRANCH"
+
+          # Get list of downloaded files (in download folder)
+          echo "Analyzing files to push..."
+          ALL_FILES=()
+          # Add all files in download/ folder (excluding .part files if desired — optional)
+          while IFS= read -r -d '' FILE; do
+            ALL_FILES+=("$FILE")
+          done < <(find download -type f -print0 2>/dev/null | sort -z)
+
+          TOTAL_FILES=${#ALL_FILES[@]}
+          if [ $TOTAL_FILES -eq 0 ]; then
+            echo "No files to push."
+            exit 0
+          fi
+
+          echo "Found $TOTAL_FILES files to push"
+
+          # Push in batches
+          push_batch "${ALL_FILES[@]}"
+          echo "All files pushed successfully!"
